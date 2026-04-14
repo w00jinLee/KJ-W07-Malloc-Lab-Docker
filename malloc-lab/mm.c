@@ -61,6 +61,7 @@ team_t team = {
 #define WSIZE 4
 #define DSIZE 8
 #define CHUNKSIZE (1<<12)
+#define MINBLOCKSIZE 24 // hedaer footer next prev 4 4 8 8
 
 #define MAX(x, y) ((x) > (y)? (x) : (y))
 
@@ -78,12 +79,17 @@ team_t team = {
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))
 
+#define PRED(bp) (*(void **)(bp))                           // 이전 주소
+#define SUCC(bp) (*(void **)((char*)(bp) + sizeof(void *))) // 다음 주소 
+
 static char*heap_listp=0;
 static void*extend_heap(size_t words);
 static void*coalesce(void *bp);
 static void *find_fit(size_t asize);
 static void place(void *bp, size_t asize);
-
+static void *free_listp;
+static void insert_free_block(void *bp);
+static void remove_free_block(void *bp);
 
 /*
  * mm_init - initialize the malloc package.
@@ -91,6 +97,7 @@ static void place(void *bp, size_t asize);
  */
 int mm_init(void)
 {
+    free_listp = NULL;
     if((heap_listp = mem_sbrk(4*WSIZE)) == (void *) -1) {
         return -1;
     }
@@ -104,6 +111,29 @@ int mm_init(void)
         return -1;                                  // NULL이면 확장 실패, -1 반환
     }
     return 0;
+}
+
+//LIFO(Last in First Out)
+static void insert_free_block(void *bp){
+    PRED(bp)=NULL;              // 맨 앞 블록은 이전 블록이 없음 (bp->prev = NULL)
+    SUCC(bp)=free_listp;        // 맨 앞 블록의 주소를 bp의 next로 설정
+    if(free_listp !=NULL){      // free_listp가 비어있지 않다면(head가 있다면) (비어있을 때 PRED(free_listp) = bp; 하면 NULL 참조해서 터짐)
+        PRED(free_listp) = bp;  // 기존 맨 앞 블록의 prev를 bp로 설정
+    }
+    free_listp = bp;            // 리스트의 맨 앞을 bp로 설정
+}
+
+static void remove_free_block(void *bp){
+    if(PRED(bp) != NULL){           // 왼쪽이 있을 때
+        SUCC(PRED(bp)) = SUCC(bp);  // 왼쪽의 next를 bp의 next로 변경
+    }
+    else{                           // 왼쪽이 없을 때(bp가 head였을 때)
+        free_listp = SUCC(bp);      // 헤드를 bp의 next로 변경
+    }   
+    if(SUCC(bp) != NULL){           // 오른쪽이 있을 때
+        PRED(SUCC(bp)) = PRED(bp);  // 오른쪽의 prev를 bp의 prev로 변경
+    }
+
 }
 
 static void *extend_heap(size_t words){ // 힙 확장
@@ -125,9 +155,9 @@ static void *extend_heap(size_t words){ // 힙 확장
 static void *find_fit(size_t asize){
     void *bp;
 
-    for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) { // prologue부터 epilogue 만나기 전까지
-        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))){     // 빈 블록이면서 현재 블록의 크기가 요청 크기 이상이면
-            return bp;                                                  // 찾으면 반환
+    for (bp = free_listp; bp != NULL; bp = SUCC(bp)) {  // head부터 free_list 끝까지 탐색,           
+        if (asize <= GET_SIZE(HDRP(bp))){               // 현재 free block의 크기가 요청 크기 이상이면
+            return bp;                                  // bp 반환      
         }
     }
     return NULL;    // 못 찾을 경우
@@ -136,13 +166,15 @@ static void *find_fit(size_t asize){
 static void place(void *bp, size_t asize)
 {
     size_t csize = GET_SIZE(HDRP(bp));          // 할당할 free block의 전체 크기
-
-    if ((csize - asize) >= (2 * DSIZE)) {       // free block에 요청한 크기를 할당하고 남는 공간이 16바이트 이상인 경우
+    remove_free_block(bp);                      
+    
+    if ((csize - asize) >= MINBLOCKSIZE) {       // free block에 요청한 크기를 할당하고 남는 공간이 최소 블록사이즈 이상인 경우
         PUT(HDRP(bp), PACK(asize, 1));          // 현재 block의 앞부분을 asize만큼 할당하고 header와 footer를 allocated block으로 표시
         PUT(FTRP(bp), PACK(asize, 1));
         bp = NEXT_BLKP(bp);                     // 분리된 다음 block으로 이동
         PUT(HDRP(bp), PACK(csize - asize, 0));  // 다음 블럭 header와 footer를 free block으로 표시
         PUT(FTRP(bp), PACK(csize - asize, 0));  
+        insert_free_block(bp);
     } else {                                    // 남는 공간이 너무 작아서 블록을 나누지 않고 그대로 할당
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
@@ -194,26 +226,34 @@ static void *coalesce(void *bp){                        // bp는 현재 free된 
     size_t size = GET_SIZE(HDRP(bp));                   // 현재 free 블록 크기
 
     if (prev_alloc && next_alloc){  // 이전, 다음 블록 둘 다 사용 중이면 합칠 수 없으므로 리턴
+        insert_free_block(bp);      // free했던 블록이므로 free list에 추가
         return bp;
     }
 
     else if (prev_alloc && !next_alloc){        // 앞 사용 중, 뒤 free 인 경우
+        remove_free_block(NEXT_BLKP(bp));       // 병합 대상인 다음 free block 제거(이미 free list에 있던 상태)
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));  // 다음 블록 크기를 현재 size에 더함
         PUT(HDRP(bp), PACK(size, 0));           // 현재 블록 header를 합쳐진 크기로 바꿈
         PUT(FTRP(bp), PACK(size, 0));           // 병합된 블록 footer를 합쳐진 크기로 바꿈
+        insert_free_block(bp);                  // 병합된 새 free blcok을 free list에 삽입
     }
 
     else if (!prev_alloc && next_alloc){            // 앞 free, 뒤 사용 중인 경우
+        remove_free_block(PREV_BLKP(bp));           // 병합 대상인 이전 free block 제거(이미 free list에 있던 상태)
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));      // 이전 블록 크기를 더함
         PUT(FTRP(bp), PACK(size, 0));               // 병합된 블록 footer를 합쳐진 크기로 바꿈
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));    // 이전 블록 header를 합쳐진 크기로 바꿈
         bp = PREV_BLKP(bp);                         // 새 시작점이 이전 블록이므로 이전 블록으로 이동
+        insert_free_block(bp);                      // 병합된 새 free blcok을 free list에 삽입
     }
     else{   // 둘 다 free 인 경우
+        remove_free_block(PREV_BLKP(bp));           // 병합 대상인 이전 free block 제거(이미 free list에 있던 상태)
+        remove_free_block(NEXT_BLKP(bp));           // 병합 대상인 다음 free block 제거(이미 free list에 있던 상태)
         size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp))); // 이전, 현재, 다음 블록 크기 전부 더함
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));    // 제일 앞 블록 header를 합쳐진 크기로 바꿈
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));    // 제일 뒤 블록 footer를 합쳐진 크기로 바꿈
         bp = PREV_BLKP(bp);                         // 새 시작점은 이전 블록이므로 이전 블록으로 이동
+        insert_free_block(bp);                      // 병합된 새 free blcok을 free list에 삽입
     }
     return bp;  // free block 시작 주소 반환
 }
